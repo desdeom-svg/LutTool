@@ -1,0 +1,19 @@
+pkg_venv/
+build/
+dist/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.spec
+*.log
+/tmp/
+.gemini/
+brain/
+*.cube
+*.txt
+# 排除大型数据
+assets/
+data/
+images/
+lutData/
