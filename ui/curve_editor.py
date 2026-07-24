@@ -39,19 +39,21 @@ class CurveEditor(QFrame):
         self.zoom_scale = 1.0
 
     def _to_screen(self, x, y):
-        # 考虑 zoom_scale (这里简单实现：只缩放绘图比例，不改变坐标轴)
+        # 考虑 zoom_scale
         w = self.canvas.width() - 2 * self.margin
         h = self.canvas.height() - 2 * self.margin
-        px = self.margin + (x / 255.0) * w
-        py = self.canvas.height() - self.margin - (y / 255.0) * h
+        max_v = float(self.lut_manager.max_val)
+        px = self.margin + (x / max_v) * w
+        py = self.canvas.height() - self.margin - (y / max_v) * h
         return px, py
 
     def _from_screen(self, px, py):
         w = self.canvas.width() - 2 * self.margin
         h = self.canvas.height() - 2 * self.margin
-        x = (px - self.margin) / w * 255.0
-        y = (self.canvas.height() - self.margin - py) / h * 255.0
-        return np.clip(x, 0, 255), np.clip(y, 0, 255)
+        max_v = float(self.lut_manager.max_val)
+        x = (px - self.margin) / w * max_v
+        y = (self.canvas.height() - self.margin - py) / h * max_v
+        return np.clip(x, 0, max_v), np.clip(y, 0, max_v)
 
     def _paint_canvas(self, event):
         painter = QPainter(self.canvas)
@@ -68,8 +70,9 @@ class CurveEditor(QFrame):
         font = QFont("Segoe UI", 9)
         painter.setFont(font)
 
+        max_v = self.lut_manager.max_val
         for i in range(5):
-            val = i * 64 if i < 4 else 255
+            val = int(i * max_v / 4)
             px, py = self._to_screen(val, val)
             
             # X 轴刻度文字
@@ -98,7 +101,7 @@ class CurveEditor(QFrame):
         ref_pen = QPen(QColor(255, 50, 50, 150), 1.0, Qt.DashLine)
         painter.setPen(ref_pen)
         p1_x, p1_y = self._to_screen(0, 0)
-        p2_x, p2_y = self._to_screen(255, 255)
+        p2_x, p2_y = self._to_screen(max_v, max_v)
         painter.drawLine(QPointF(p1_x, p1_y), QPointF(p2_x, p2_y))
 
         # 绘制主 LUT 曲线
@@ -114,9 +117,12 @@ class CurveEditor(QFrame):
         curve_color = ch_colors.get(self.lut_manager.current_channel, QColor(100, 150, 255))
         
         painter.setPen(QPen(curve_color, 2))
-        for i in range(255):
+        # 采样绘制曲线，避免高位深时循环次数过多
+        step = max(1, max_v // 512)
+        for i in range(0, max_v, step):
+            next_i = min(i + step, max_v)
             x1, y1 = self._to_screen(i, lut[i])
-            x2, y2 = self._to_screen(i + 1, lut[i+1])
+            x2, y2 = self._to_screen(next_i, lut[next_i])
             painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
         # 绘制控制点

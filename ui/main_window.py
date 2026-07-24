@@ -32,6 +32,7 @@ class LutToolWindow(QMainWindow):
         self.black_val = 0
         self.white_val = 255
         self.is_sync_view = False
+        self.is_roi_mode = False
         
         self._init_ui()
         self._apply_styles()
@@ -73,6 +74,7 @@ class LutToolWindow(QMainWindow):
         # 信号连接
         self.view_curve.curveChanged.connect(self._on_curve_changed)
         self.view_orig.pixelClicked.connect(self._on_pixel_clicked)
+        self.view_orig.roiAdded.connect(self._update_processed_images) # ROI 变化时刷新
 
         self.view_orig.viewChanged.connect(lambda: self._sync_views(self.view_orig))
         self.view_processed.viewChanged.connect(lambda: self._sync_views(self.view_processed))
@@ -155,24 +157,43 @@ class LutToolWindow(QMainWindow):
         # --- 自动采样管理 (状态 Action) ---
         self.act_pick_black = QAction(" 采样黑场 (背景)", self)
         self.act_pick_black.setCheckable(True)
-        self.act_pick_black.triggered.connect(lambda: self._start_picking('black'))
+        self.act_pick_black.triggered.connect(lambda checked: self._start_picking('black', checked))
         self.toolbar.addAction(self.act_pick_black)
 
         self.act_pick_white = QAction(" 采样白场 (目标)", self)
         self.act_pick_white.setCheckable(True)
-        self.act_pick_white.triggered.connect(lambda: self._start_picking('white'))
+        self.act_pick_white.triggered.connect(lambda checked: self._start_picking('white', checked))
         self.toolbar.addAction(self.act_pick_white)
         
         self.toolbar.addSeparator()
         self.act_roi_defect = QAction(" 框选不良区域", self)
         self.act_roi_defect.setCheckable(True)
-        self.act_roi_defect.triggered.connect(lambda: self._set_roi_mode('defect'))
+        self.act_roi_defect.triggered.connect(lambda checked: self._set_roi_mode('defect', checked))
         self.toolbar.addAction(self.act_roi_defect)
         
         self.act_roi_bg = QAction(" 框选背景区域", self)
         self.act_roi_bg.setCheckable(True)
-        self.act_roi_bg.triggered.connect(lambda: self._set_roi_mode('bg'))
+        self.act_roi_bg.triggered.connect(lambda checked: self._set_roi_mode('bg', checked))
         self.toolbar.addAction(self.act_roi_bg)
+
+        # --- ROI 局部模式 (新需求) ---
+        self.toolbar.addSeparator()
+        self.act_draw_roi = QAction(" 绘制 ROI", self)
+        self.act_draw_roi.setCheckable(True)
+        self.act_draw_roi.triggered.connect(lambda checked: self._set_roi_mode('roi', checked))
+        self.toolbar.addAction(self.act_draw_roi)
+
+        self.act_roi_mode = QAction(" ROI 模式", self)
+        self.act_roi_mode.setCheckable(True)
+        self.act_roi_mode.setChecked(False)
+        self.act_roi_mode.setToolTip("开启时 LUT 仅对 ROI 区域生效，关闭时全局生效")
+        self.act_roi_mode.triggered.connect(self._toggle_roi_apply_mode)
+        self.toolbar.addAction(self.act_roi_mode)
+
+        act_clear_roi = QAction(" 清除 ROI", self)
+        act_clear_roi.setIcon(self.style().standardIcon(QStyle.SP_DialogDiscardButton))
+        act_clear_roi.triggered.connect(lambda: [self.view_orig.clear_rois(), self._update_processed_images()])
+        self.toolbar.addAction(act_clear_roi)
         
         # --- 曲线模式切换 (Phase 19) ---
         self.toolbar.addSeparator()
@@ -292,23 +313,54 @@ class LutToolWindow(QMainWindow):
         self._on_curve_changed()
         self.view_curve.canvas.update()
 
-    def _set_roi_mode(self, mode):
-        if mode == 'defect' and self.act_roi_defect.isChecked():
-            self.act_roi_bg.setChecked(False)
-            self.view_orig.set_drawing_mode('defect')
-        elif mode == 'bg' and self.act_roi_bg.isChecked():
-            self.act_roi_defect.setChecked(False)
-            self.view_orig.set_drawing_mode('bg')
+    def _set_roi_mode(self, mode, checked=True):
+        # 确定最终模式：如果取消选中，则模式为 None
+        final_mode = mode if checked else None
+        
+        # 取消互斥按钮的选中状态
+        self.act_roi_defect.setChecked(final_mode == 'defect')
+        self.act_roi_bg.setChecked(final_mode == 'bg')
+        self.act_draw_roi.setChecked(final_mode == 'roi')
+        
+        # 取消采样工具的选中
+        self.act_pick_black.setChecked(False)
+        self.act_pick_white.setChecked(False)
+        
+        # 更新图像查看器的状态
+        self.view_orig.set_drawing_mode(final_mode)
+
+    def _start_picking(self, ptype, checked=True):
+        final_type = ptype if checked else None
+        
+        for act in [self.act_pick_black, self.act_pick_white]:
+            act.setChecked(act.text().find('黑场') != -1 if final_type == 'black' else (act.text().find('白场') != -1 if final_type == 'white' else False))
+            
+        # 此时也要确保互斥的 ROI 按钮取消
+        self.act_roi_defect.setChecked(False)
+        self.act_roi_bg.setChecked(False)
+        self.act_draw_roi.setChecked(False)
+        
+        if final_type:
+            QApplication.setOverrideCursor(Qt.CrossCursor)
+            self.view_orig.set_drawing_mode('pick') # 特殊模式用于采样
+            self.picking_mode = final_type
         else:
-            self.act_roi_defect.setChecked(False)
-            self.act_roi_bg.setChecked(False)
+            QApplication.restoreOverrideCursor()
             self.view_orig.set_drawing_mode(None)
+            self.picking_mode = None
+
+    def _toggle_roi_apply_mode(self, checked):
+        """开启/关闭 ROI 局部应用模式"""
+        self.is_roi_mode = checked
+        if checked and not self.view_orig.generic_rois:
+            QMessageBox.information(self, "信息", "ROI 模式已开启。请点击工具栏【绘制 ROI】在原图上圈选感兴趣区域。")
+        self._update_processed_images()
 
     def _toggle_sync_view(self, checked):
         self.is_sync_view = checked
 
-    def _sync_views(self, source_view):
-        if not self.is_sync_view: return
+    def _sync_views(self, source_view, force=False):
+        if not self.is_sync_view and not force: return
         
         self.view_orig.blockSignals(True)
         self.view_processed.blockSignals(True)
@@ -346,6 +398,11 @@ class LutToolWindow(QMainWindow):
             QPushButton:hover { background-color: #45454a; border-color: #555; }
             QPushButton:pressed { background-color: #25252a; }
             QPushButton:checked { background-color: #2e5a88; border-color: #4a90e2; }
+            QToolBar QToolButton:checked {
+                background-color: #2e5a88;
+                border: 1px solid #4a90e2;
+                border-radius: 4px;
+            }
             QTableWidget {
                 background-color: #212124;
                 gridline-color: #333;
@@ -373,7 +430,8 @@ class LutToolWindow(QMainWindow):
 
     def _batch_update_table(self):
         from PyQt5.QtWidgets import QInputDialog
-        val, ok = QInputDialog.getInt(self, "批量修改", "输入新的映射值 (0-255):", 0, 0, 255)
+        max_v = self.lut_manager.max_val
+        val, ok = QInputDialog.getInt(self, "批量修改", f"输入新的映射值 (0-{max_v}):", 0, 0, max_v)
         if ok:
             self.table.blockSignals(True)
             for range_ in self.table.selectedRanges():
@@ -396,11 +454,27 @@ class LutToolWindow(QMainWindow):
                 QMessageBox.critical(self, "错误", "无法读取该图像格式")
                 return
             
-            # --- 自动识别单通道/多通道并调整 UI (Phase 22) ---
+            # --- 自动识别位深与频道 (Phase 22/25) ---
             is_color = len(self.original_image.shape) >= 3 and self.original_image.shape[2] >= 3
             self.channel_combo.setEnabled(is_color)
+            
+            # 自动解析位深
+            if self.original_image.dtype == np.uint8:
+                self.lut_manager.set_bit_depth(8)
+            else:
+                max_val = self.original_image.max()
+                if max_val <= 1023:
+                    self.lut_manager.set_bit_depth(10)
+                elif max_val <= 4095:
+                    self.lut_manager.set_bit_depth(12)
+                else:
+                    self.lut_manager.set_bit_depth(16)
+                
+            # 同步 UI 表格量程
+            self._update_table_range()
+                
             if not is_color:
-                self.channel_combo.setCurrentIndex(0) # 强制回到全通道/灰度模式
+                self.channel_combo.setCurrentIndex(0) 
                 self.lut_manager.set_current_channel('RGB')
                 
             self.filtered_image = self.original_image.copy()
@@ -408,6 +482,10 @@ class LutToolWindow(QMainWindow):
             self.view_orig.set_image(self.filtered_image)
             self.hist_orig.set_image(self.filtered_image)
             self._update_processed_images()
+            
+            # Phase 25: 加载后自动同步初始缩放/位置
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(100, lambda: self._sync_views(self.view_orig, force=True))
 
     def _export_image(self):
         if self.processed_image is None or self.original_path is None:
@@ -468,17 +546,36 @@ class LutToolWindow(QMainWindow):
         # 同步表格
         self.table.blockSignals(True)
         lut = self.lut_manager.get_lut()
-        for i in range(256):
-            self.table.item(i, 1).setText(str(lut[i]))
+        row_count = self.table.rowCount()
+        for i in range(row_count):
+            if i < len(lut):
+                self.table.item(i, 1).setText(str(lut[i]))
         self.table.blockSignals(False)
         self._update_processed_images()
+
+    def _update_table_range(self):
+        """根据当前 LUT 分辨率更新表格行数 (Phase 26)"""
+        max_v = self.lut_manager.max_val
+        # UI 性能优化：表格上限 4096 (12bit)，16bit 下仅显示前 4096 行
+        display_rows = min(max_v, 4095) + 1
+        
+        self.table.blockSignals(True)
+        self.table.setRowCount(display_rows)
+        for i in range(display_rows):
+            if not self.table.item(i, 0):
+                self.table.setItem(i, 0, QTableWidgetItem(str(i)))
+                self.table.item(i, 0).setFlags(Qt.ItemIsEnabled)
+            if not self.table.item(i, 1):
+                self.table.setItem(i, 1, QTableWidgetItem(""))
+        self.table.blockSignals(False)
+        self._on_curve_changed()
 
     def _on_table_changed(self, item):
         if item.column() == 1:
             try:
                 row = item.row()
                 val = int(item.text())
-                val = np.clip(val, 0, 255)
+                val = np.clip(val, 0, self.lut_manager.max_val)
                 lut = self.lut_manager.get_lut()
                 lut[row] = val
                 self._update_processed_images()
@@ -493,7 +590,10 @@ class LutToolWindow(QMainWindow):
             else:
                 applied_lut = self.lut_manager.get_lut()
                 
-            self.processed_image = self.image_processor.apply_lut(self.filtered_image, applied_lut)
+            # 根据是否开启 ROI 模式决定传入的区域
+            active_rois = self.view_orig.generic_rois if self.is_roi_mode else None
+                
+            self.processed_image = self.image_processor.apply_lut(self.filtered_image, applied_lut, rois=active_rois)
             diff = self.image_processor.calculate_difference(self.filtered_image, self.processed_image)
             self.view_processed.set_image(self.processed_image, keep_view=True)
             self.view_diff.set_image(diff, keep_view=True)
@@ -514,23 +614,6 @@ class LutToolWindow(QMainWindow):
                 self.label_cnr.setText("当前 CNR: 请框选不良及背景")
                 self.label_otsu.setText("类间方差: -")
 
-    # --- 采样与自动拉伸逻辑 (Phase 9: 迁移至 Toolbar Action) ---
-    def _start_picking(self, mode):
-        """开启采样模式"""
-        self.picking_mode = mode
-        if mode == 'black':
-            self.act_pick_black.setChecked(True)
-            self.act_pick_white.setChecked(False)
-            self.setCursor(Qt.CrossCursor)
-        elif mode == 'white':
-            self.act_pick_white.setChecked(True)
-            self.act_pick_black.setChecked(False)
-            self.setCursor(Qt.CrossCursor)
-        else:
-            self.picking_mode = None
-            self.act_pick_black.setChecked(False)
-            self.act_pick_white.setChecked(False)
-            self.unsetCursor()
 
     def _on_pixel_clicked(self, x, y, rgb):
         """点击图像时的回调"""

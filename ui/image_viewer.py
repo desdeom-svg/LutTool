@@ -1,12 +1,115 @@
-from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem, QFrame, QVBoxLayout, QLabel, QWidget
-from PyQt5.QtCore import Qt, QPoint, QRectF, pyqtSignal
+from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem, QFrame, QVBoxLayout, QLabel, QWidget, QGraphicsItem
+from PyQt5.QtCore import Qt, QPoint, QRectF, pyqtSignal, QPointF, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QCursor, QColor, QPainter, QPen
 import cv2
 import numpy as np
 
+class EditableRectItem(QGraphicsRectItem):
+    """可移动且可缩放的矩形条目"""
+    def __init__(self, rect, parent=None):
+        super().__init__(rect, parent)
+        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemSendsGeometryChanges)
+        self.setAcceptHoverEvents(True)
+        self.handleSize = 8
+        self.mousePressPos = None
+        self.mousePressRect = None
+        self.handlePressed = None
+        self.changed_callback = None
+
+    def hoverMoveEvent(self, event):
+        handle = self._get_handle_at(event.pos())
+        cursor = Qt.ArrowCursor
+        if handle == 'top': cursor = Qt.SizeVerCursor
+        elif handle == 'bottom': cursor = Qt.SizeVerCursor
+        elif handle == 'left': cursor = Qt.SizeHorCursor
+        elif handle == 'right': cursor = Qt.SizeHorCursor
+        elif handle == 'topleft': cursor = Qt.SizeFDiagCursor
+        elif handle == 'bottomright': cursor = Qt.SizeFDiagCursor
+        elif handle == 'topright': cursor = Qt.SizeBDiagCursor
+        elif handle == 'bottomleft': cursor = Qt.SizeBDiagCursor
+        self.setCursor(cursor)
+        super().hoverMoveEvent(event)
+
+    def _get_handle_at(self, pos):
+        r = self.rect()
+        s = self.handleSize
+        if abs(pos.x() - r.left()) < s and abs(pos.y() - r.top()) < s: return 'topleft'
+        if abs(pos.x() - r.right()) < s and abs(pos.y() - r.bottom()) < s: return 'bottomright'
+        if abs(pos.x() - r.left()) < s and abs(pos.y() - r.bottom()) < s: return 'bottomleft'
+        if abs(pos.x() - r.right()) < s and abs(pos.y() - r.top()) < s: return 'topright'
+        if abs(pos.y() - r.top()) < s: return 'top'
+        if abs(pos.y() - r.bottom()) < s: return 'bottom'
+        if abs(pos.x() - r.left()) < s: return 'left'
+        if abs(pos.x() - r.right()) < s: return 'right'
+        return None
+
+    def mousePressEvent(self, event):
+        self.handlePressed = self._get_handle_at(event.pos())
+        if self.handlePressed:
+            self.mousePressPos = event.pos()
+            self.mousePressRect = self.rect()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.handlePressed:
+            diff = event.pos() - self.mousePressPos
+            r = QRectF(self.mousePressRect)
+            if 'top' in self.handlePressed: r.setTop(r.top() + diff.y())
+            if 'bottom' in self.handlePressed: r.setBottom(r.bottom() + diff.y())
+            if 'left' in self.handlePressed: r.setLeft(r.left() + diff.x())
+            if 'right' in self.handlePressed: r.setRight(r.right() + diff.x())
+            
+            # 防止反转
+            if r.width() > 5 and r.height() > 5:
+                self.setRect(r.normalized())
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self.handlePressed = None
+        if self.changed_callback:
+            self.changed_callback()
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange and self.changed_callback:
+            # 延迟调用以确保位置已更新
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, self.changed_callback)
+        return super().itemChange(change, value)
+
+    def contextMenuEvent(self, event):
+        from PyQt5.QtWidgets import QMenu, QAction
+        menu = QMenu()
+        del_act = QAction("删除该 ROI", None)
+        del_act.triggered.connect(self._on_delete)
+        menu.addAction(del_act)
+        menu.exec_(event.screenPos())
+
+    def _on_delete(self):
+        if self.changed_callback: # 使用现有的 callback 或新增
+            # 我们需要通知父级删除
+            if hasattr(self, 'delete_callback') and self.delete_callback:
+                self.delete_callback(self)
+
+    def paint(self, painter, option, widget):
+        super().paint(painter, option, widget)
+        # 绘制手柄
+        if self.isSelected():
+            painter.setBrush(Qt.white)
+            painter.setPen(Qt.black)
+            r = self.rect()
+            s = self.handleSize
+            painter.drawRect(QRectF(r.left(), r.top(), s/2, s/2))
+            painter.drawRect(QRectF(r.right()-s/2, r.bottom()-s/2, s/2, s/2))
+            painter.drawRect(QRectF(r.left(), r.bottom()-s/2, s/2, s/2))
+            painter.drawRect(QRectF(r.right()-s/2, r.top(), s/2, s/2))
+
 class ImageViewer(QFrame):
     pixelClicked = pyqtSignal(int, int, list) # x, y, [r, g, b]
     viewChanged = pyqtSignal() # 用于同步视图
+    roiAdded = pyqtSignal() # 新增信号，当 ROI 绘制完成时触发
 
     def __init__(self, title="", parent=None):
         super().__init__(parent)
@@ -44,17 +147,28 @@ class ImageViewer(QFrame):
         self.drawing_mode = None
         self.roi_defect = None
         self.roi_bg = None
+        self.generic_rois = [] # 存储为 [x, y, w, h]
         self.start_pos = None
         
-        self.rect_item_defect = QGraphicsRectItem()
+        self.rect_item_defect = EditableRectItem(QRectF(0, 0, 0, 0))
         self.rect_item_defect.setPen(QPen(QColor(255, 0, 0), 2))
         self.rect_item_defect.setZValue(10)
+        self.rect_item_defect.changed_callback = self.sync_defect_bg_rois
+        self.rect_item_defect.delete_callback = self.remove_special_roi
         self.scene.addItem(self.rect_item_defect)
         
-        self.rect_item_bg = QGraphicsRectItem()
+        self.rect_item_bg = EditableRectItem(QRectF(0, 0, 0, 0))
         self.rect_item_bg.setPen(QPen(QColor(0, 255, 0), 2))
         self.rect_item_bg.setZValue(10)
+        self.rect_item_bg.changed_callback = self.sync_defect_bg_rois
+        self.rect_item_bg.delete_callback = self.remove_special_roi
         self.scene.addItem(self.rect_item_bg)
+
+        self.generic_rect_items = [] # 存储绘制好的 QGraphicsRectItem
+        self.temp_rect_item = QGraphicsRectItem() # 正在绘制中的临时框
+        self.temp_rect_item.setPen(QPen(QColor(255, 255, 0), 2, Qt.DashLine))
+        self.temp_rect_item.setZValue(11)
+        self.scene.addItem(self.temp_rect_item)
         
         # 连接鼠标事件
         self.view.mousePressEvent = self._handle_mouse_press
@@ -63,6 +177,30 @@ class ImageViewer(QFrame):
         self.view.wheelEvent = self._handle_wheel
         self.view.horizontalScrollBar().valueChanged.connect(lambda _: self.viewChanged.emit())
         self.view.verticalScrollBar().valueChanged.connect(lambda _: self.viewChanged.emit())
+
+    def remove_special_roi(self, item):
+        """重置不良区或背景区"""
+        item.setPos(0, 0)
+        item.setRect(0, 0, 0, 0)
+        self.sync_defect_bg_rois()
+
+    def sync_defect_bg_rois(self):
+        """同步不良区和背景区的数据"""
+        rd = self.rect_item_defect.rect()
+        pd = self.rect_item_defect.pos()
+        if rd.width() > 0:
+            self.roi_defect = [int(rd.x() + pd.x()), int(rd.y() + pd.y()), int(rd.width()), int(rd.height())]
+        else:
+            self.roi_defect = None
+        
+        rb = self.rect_item_bg.rect()
+        pb = self.rect_item_bg.pos()
+        if rb.width() > 0:
+            self.roi_bg = [int(rb.x() + pb.x()), int(rb.y() + pb.y()), int(rb.width()), int(rb.height())]
+        else:
+            self.roi_bg = None
+            
+        self.roiAdded.emit()
 
     def set_image(self, cv_img, keep_view=False):
         if cv_img is None:
@@ -117,6 +255,13 @@ class ImageViewer(QFrame):
         self.roi_bg = None
         self.rect_item_defect.setRect(0, 0, 0, 0)
         self.rect_item_bg.setRect(0, 0, 0, 0)
+        
+        # 清除通用的 ROI
+        for item in self.generic_rect_items:
+            self.scene.removeItem(item)
+        self.generic_rect_items.clear()
+        self.generic_rois.clear()
+        self.temp_rect_item.setRect(0, 0, 0, 0)
 
     def _handle_mouse_press(self, event):
         # 左键点击查询像素或框选
@@ -125,8 +270,14 @@ class ImageViewer(QFrame):
             x, y = int(scene_pos.x()), int(scene_pos.y())
             
             if self.drawing_mode:
-                self.start_pos = (x, y)
-                return
+                # 检查是否点到了已有的可编辑框上
+                item = self.view.itemAt(event.pos())
+                if isinstance(item, EditableRectItem):
+                    # 如果点到了已有的框，则让 QGraphicsView 处理选中/移动，而不触发新框绘制
+                    pass
+                else:
+                    self.start_pos = (x, y)
+                    return
                 
             if self.cv_img is not None:
                 h, w = self.cv_img.shape[:2]
@@ -156,9 +307,13 @@ class ImageViewer(QFrame):
             rh = abs(h)
             
             if self.drawing_mode == 'defect':
+                self.rect_item_defect.setPos(0, 0)
                 self.rect_item_defect.setRect(rx, ry, rw, rh)
             elif self.drawing_mode == 'bg':
+                self.rect_item_bg.setPos(0, 0)
                 self.rect_item_bg.setRect(rx, ry, rw, rh)
+            elif self.drawing_mode == 'roi':
+                self.temp_rect_item.setRect(rx, ry, rw, rh)
             return
             
         QGraphicsView.mouseMoveEvent(self.view, event)
@@ -167,6 +322,12 @@ class ImageViewer(QFrame):
         if self.drawing_mode and self.start_pos:
             scene_pos = self.view.mapToScene(event.pos())
             x, y = int(scene_pos.x()), int(scene_pos.y())
+            # 限制坐标在图像范围内
+            if self.cv_img is not None:
+                img_h, img_w = self.cv_img.shape[:2]
+                x = max(0, min(img_w, x))
+                y = max(0, min(img_h, y))
+
             w = x - self.start_pos[0]
             h = y - self.start_pos[1]
             
@@ -175,16 +336,50 @@ class ImageViewer(QFrame):
             rw = abs(w)
             rh = abs(h)
             
-            if rw > 0 and rh > 0:
+            if rw > 2 and rh > 2: # 过滤极小的点击
                 if self.drawing_mode == 'defect':
-                    self.roi_defect = [rx, ry, rw, rh]
+                    self.rect_item_defect.setPos(0, 0)
+                    self.rect_item_defect.setRect(rx, ry, rw, rh)
+                    self.sync_defect_bg_rois()
                 elif self.drawing_mode == 'bg':
-                    self.roi_bg = [rx, ry, rw, rh]
+                    self.rect_item_bg.setPos(0, 0)
+                    self.rect_item_bg.setRect(rx, ry, rw, rh)
+                    self.sync_defect_bg_rois()
+                elif self.drawing_mode == 'roi':
+                    # 创建并添加正式的 RectItem (使用可编辑版本)
+                    item = EditableRectItem(QRectF(rx, ry, rw, rh))
+                    item.setPen(QPen(QColor(255, 255, 0), 2))
+                    item.setZValue(9)
+                    item.changed_callback = self.sync_generic_rois
+                    item.delete_callback = self.remove_generic_roi
+                    self.scene.addItem(item)
+                    self.generic_rect_items.append(item)
+                    self.sync_generic_rois() # 同步一次
+                    self.temp_rect_item.setRect(0, 0, 0, 0)
+                    self.roiAdded.emit()
+            
             self.start_pos = None
-            # Emit a special signal or we can just poll it from main window
             return
             
         QGraphicsView.mouseReleaseEvent(self.view, event)
+
+    def remove_generic_roi(self, item):
+        """删除指定的通用 ROI"""
+        if item in self.generic_rect_items:
+            self.scene.removeItem(item)
+            self.generic_rect_items.remove(item)
+            self.sync_generic_rois()
+
+    def sync_generic_rois(self):
+        """将图形条目的位置同步回数据列表"""
+        self.generic_rois.clear()
+        for item in self.generic_rect_items:
+            # 获取场景坐标下的矩形
+            r = item.rect()
+            p = item.pos()
+            # 组合成最终坐标 [x, y, w, h]
+            self.generic_rois.append([r.x() + p.x(), r.y() + p.y(), r.width(), r.height()])
+        self.roiAdded.emit()
 
     def _handle_wheel(self, event):
         zoom_in_factor = 1.25

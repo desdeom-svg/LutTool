@@ -5,30 +5,62 @@ import math
 
 class ImageProcessor:
     @staticmethod
-    def apply_lut(image, lut):
+    def apply_lut(image, lut, rois=None):
         """应用 LUT 到图像 (支持 1D 和 3x1D)"""
         if image is None:
             return None
         
-        # 如果是彩色图且 lut 是多通道的 [B_lut, G_lut, R_lut]
-        if len(image.shape) == 3 and len(lut.shape) == 2 and lut.shape[0] == 3:
-            # 分离通道，适配 3 通道 and 4 通道
-            channels = cv2.split(image)
-            if len(channels) >= 3:
-                # 仅处理前三个颜色通道 (B, G, R)
-                b_proc = cv2.LUT(channels[0], lut[0])
-                g_proc = cv2.LUT(channels[1], lut[1])
-                r_proc = cv2.LUT(channels[2], lut[2])
-                
-                new_channels = [b_proc, g_proc, r_proc]
-                if len(channels) == 4:
-                    # 保留 Alpha 通道不变
-                    new_channels.append(channels[3])
-                    
-                return cv2.merge(new_channels)
+        # 1. 计算处理后的图 (副本)
+        processed = None
+        
+        # 针对 8位图且 LUT 长度适配时使用 OpenCV 加速
+        if image.dtype == np.uint8 and lut.shape[-1] == 256:
+            if len(image.shape) == 3 and len(lut.shape) == 2 and lut.shape[0] == 3:
+                channels = cv2.split(image)
+                if len(channels) >= 3:
+                    b_proc = cv2.LUT(channels[0], lut[0])
+                    g_proc = cv2.LUT(channels[1], lut[1])
+                    r_proc = cv2.LUT(channels[2], lut[2])
+                    new_channels = [b_proc, g_proc, r_proc]
+                    if len(channels) == 4: new_channels.append(channels[3])
+                    processed = cv2.merge(new_channels)
             
-        # 否则尝试通用 LUT (如果是彩色图且 lut 是单通道，Opencv 会自动对所有通道应用该 lut)
-        return cv2.LUT(image, lut)
+            if processed is None:
+                processed = cv2.LUT(image, lut)
+        else:
+            # 针对高位深图或非 256 长度 LUT 使用 Numpy 映射
+            # 安全裁剪，防止索引越界
+            idx = np.clip(image, 0, lut.shape[-1] - 1)
+            
+            if len(image.shape) == 3 and len(lut.shape) == 2 and lut.shape[0] == 3:
+                channels = cv2.split(idx)
+                b_proc = lut[0][channels[0]]
+                g_proc = lut[1][channels[1]]
+                r_proc = lut[2][channels[2]]
+                new_channels = [b_proc, g_proc, r_proc]
+                if len(channels) == 4: new_channels.append(channels[3])
+                processed = cv2.merge(new_channels)
+            else:
+                processed = lut[idx]
+            
+            # 强制保证输出类型与输入一致 (防止 uint16 图应用 uint8 LUT 后类型变动导致后续 absdiff 崩溃)
+            processed = processed.astype(image.dtype)
+            
+        # 2. 如果没有 ROIs 或者是全局模式，直接返回 processed
+        if not rois:
+            return processed
+            
+        # 3. 如果有 ROIs，则进行局部替换
+        result = image.copy()
+        H, W = image.shape[:2]
+        for x, y, w, h in rois:
+            # 坐标安全转换与裁剪
+            x1, y1 = max(0, int(x)), max(0, int(y))
+            x2, y2 = min(W, int(x + w)), min(H, int(y + h))
+            if x2 > x1 and y2 > y1:
+                result[y1:y2, x1:x2] = processed[y1:y2, x1:x2]
+                
+        return result
 
     @staticmethod
     def calculate_difference(original, processed):
@@ -36,9 +68,13 @@ class ImageProcessor:
         if original is None or processed is None:
             return None
         # 确保尺寸一致
-        if original.shape != processed.shape:
+        if original.shape[:2] != processed.shape[:2]:
             processed = cv2.resize(processed, (original.shape[1], original.shape[0]))
         
+        # 确保类型一致
+        if original.dtype != processed.dtype:
+            processed = processed.astype(original.dtype)
+            
         diff = cv2.absdiff(original, processed)
         return diff
 
@@ -163,20 +199,27 @@ class ImageProcessor:
         if fg_crop.size == 0 or bg_crop.size == 0:
             raise ValueError("框选区域超出边界或为空。")
             
+        # 位深适配
+        max_v = 255
+        if gray.dtype != np.uint8:
+            max_v = 4095 if np.max(gray) <= 4095 else 65535
+            
         best_score = -1
         best_gain = 1.0
         best_offset = 0
-        best_lut = np.arange(256, dtype=np.uint8)
+        best_lut = np.arange(max_v + 1, dtype=gray.dtype)
         
-        gains = np.arange(0.5, 3.1, 0.25)
-        offsets = range(-50, 51, 15)
+        gains = np.arange(0.5, 3.1, 0.5)
+        offsets = np.linspace(-max_v*0.2, max_v*0.2, 5)
         
+        x_base = np.arange(max_v + 1)
         for gain in gains:
             for offset in offsets:
-                lut = np.clip(np.arange(256) * gain + offset, 0, 255).astype(np.uint8)
+                lut = np.clip(x_base * gain + offset, 0, max_v).astype(gray.dtype)
                 
-                fg_res = cv2.LUT(fg_crop, lut)
-                bg_res = cv2.LUT(bg_crop, lut)
+                # 使用 numpy 映射代替 cv2.LUT 以兼容高位深
+                fg_res = lut[fg_crop]
+                bg_res = lut[bg_crop]
                 
                 entropy_fg = ImageProcessor.calculate_entropy(fg_res)
                 entropy_bg = ImageProcessor.calculate_entropy(bg_res)
@@ -191,7 +234,6 @@ class ImageProcessor:
                 sigma_bg = max(sigma_bg, 0.1)
                 
                 score = contrast / (sigma_bg * entropy)
-                
                 if score > best_score:
                     best_score = score
                     best_gain = gain
@@ -220,56 +262,61 @@ class ImageProcessor:
             
         is_orig_color = len(original.shape) == 3 and original.shape[2] >= 3
         is_proc_color = len(processed.shape) == 3 and processed.shape[2] >= 3
+        
+        # 自动识别量程
+        max_v = 255
+        if original.dtype != np.uint8:
+            max_val_found = np.max(original)
+            if max_val_found <= 1023: max_v = 1023
+            elif max_val_found <= 4095: max_v = 4095
+            else: max_v = 65535
+            
+        lut_size = max_v + 1
 
         def calculate_single(o_ch, p_ch):
+            dtype = original.dtype
             if mode == "histogram":
                 # --- 直方图模式 ---
-                h_o, _ = np.histogram(o_ch, 256, [0, 256])
-                h_p, _ = np.histogram(p_ch, 256, [0, 256])
-                # 对直方图平滑处理减少噪声
-                h_o = cv2.GaussianBlur(h_o.astype(np.float32), (7, 1), 0).flatten()
-                h_p = cv2.GaussianBlur(h_p.astype(np.float32), (7, 1), 0).flatten()
+                h_o, _ = np.histogram(o_ch, lut_size, [0, lut_size])
+                h_p, _ = np.histogram(p_ch, lut_size, [0, lut_size])
+                h_o = cv2.GaussianBlur(h_o.astype(np.float32), (15, 1), 0).flatten()
+                h_p = cv2.GaussianBlur(h_p.astype(np.float32), (15, 1), 0).flatten()
                 
                 c_o = h_o.cumsum()
                 c_p = h_p.cumsum()
                 c_o_n = c_o / max(c_o[-1], 1)
                 c_p_n = c_p / max(c_p[-1], 1)
                 
-                lut = np.zeros(256, dtype=np.uint8)
-                for i in range(256):
+                lut = np.zeros(lut_size, dtype=dtype)
+                for i in range(lut_size):
                     target_val = c_o_n[i]
                     j = np.searchsorted(c_p_n, target_val)
-                    lut[i] = np.clip(j, 0, 255).astype(np.uint8)
-                
-                # 强力平滑曲线
-                lut = cv2.GaussianBlur(lut.astype(np.float32), (11, 1), 0).flatten()
-                return np.clip(lut, 0, 255).astype(np.uint8)
+                    lut[i] = np.clip(j, 0, max_v).astype(dtype)
+                return lut
             
             else:
-                # --- 像素级映射模式 (Full/Sparse) ---
+                # --- 像素级映射模式 ---
                 o_flat = o_ch.flatten()
                 p_flat = p_ch.flatten()
-                p_sum = np.bincount(o_flat, weights=p_flat, minlength=256)
-                p_cnt = np.bincount(o_flat, minlength=256)
+                p_sum = np.bincount(o_flat, weights=p_flat, minlength=lut_size)
+                p_cnt = np.bincount(o_flat, minlength=lut_size)
                 
-                lut = np.arange(256, dtype=np.uint8)
+                lut = np.arange(lut_size, dtype=dtype)
                 mask = p_cnt > 0
-                lut[mask] = np.clip(p_sum[mask] / p_cnt[mask], 0, 255).astype(np.uint8)
+                lut[mask] = np.clip(p_sum[mask] / p_cnt[mask], 0, max_v).astype(dtype)
                 
-                # 插值补全缺失
                 if not np.all(mask):
                     ki = np.where(mask)[0]
                     mi = np.where(~mask)[0]
                     if ki.size > 0:
-                        lut[mi] = np.interp(mi, ki, lut[ki]).astype(np.uint8)
+                        lut[mi] = np.interp(mi, ki, lut[ki]).astype(dtype)
                 
                 if mode == "sparse":
-                    # 采样到 17 点再恢复
-                    samples = np.linspace(0, 255, 17, dtype=int)
+                    samples = np.linspace(0, max_v, 17, dtype=int)
                     sparse_vals = lut[samples]
-                    lut = np.interp(np.arange(256), samples, sparse_vals).astype(np.uint8)
+                    lut = np.interp(np.arange(lut_size), samples, sparse_vals).astype(dtype)
                 
-                return np.clip(lut, 0, 255).astype(np.uint8)
+                return lut
 
         if is_orig_color and is_proc_color:
             o_split = cv2.split(original)[:3]
