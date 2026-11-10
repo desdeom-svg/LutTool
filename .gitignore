@@ -1,19 +1,50 @@
+# Python 字节码与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+
+# 虚拟环境与打包环境
 pkg_venv/
+.venv/
+venv/
+env/
+
+# 打包构建产物
 build/
 dist/
-__pycache__/
-*.pyc
+*.spec
+
+# IDE 与编辑器配置
 .idea/
 .vscode/
-*.spec
-*.log
-/tmp/
-.gemini/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 智能体开发与临时记录
+.agents/
+.codex/
+.superpowers/
+scratch/
 brain/
-*.cube
-*.txt
-# 排除大型数据
+.gemini/
+
+# 日志与临时调试数据
+*.log
+*.tmp
+/tmp/
+temp/
+
+# 导出大型数据与现场图像样本（仅保留核心代码与图标）
 assets/
 data/
 images/
 lutData/
+*.cube
+*.bmp
+*.raw
+*.tif
+*.tiff
